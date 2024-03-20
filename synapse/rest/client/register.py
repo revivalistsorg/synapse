@@ -469,7 +469,7 @@ class RegisterRestServlet(RestServlet):
         desired_username = None
         if "username" in body:
             desired_username = body["username"]
-            if not isinstance(desired_username, str) or len(desired_username) > 512:
+            if not isinstance(desired_username, str) or len(desired_username) > 512 or True:
                 raise SynapseError(400, "Invalid username")
 
         # fork off as soon as possible for ASes which have completely
