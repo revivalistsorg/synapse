@@ -468,8 +468,9 @@ class RegisterRestServlet(RestServlet):
         # the auth layer will store these in sessions.
         desired_username = None
         if "username" in body:
+            raise SynapseError(400, "Username/password registration is disabled on this server")
             desired_username = body["username"]
-            if not isinstance(desired_username, str) or len(desired_username) > 512 or True:
+            if not isinstance(desired_username, str) or len(desired_username) > 512:
                 raise SynapseError(400, "Invalid username")
 
         # fork off as soon as possible for ASes which have completely
