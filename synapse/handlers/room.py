@@ -1344,6 +1344,7 @@ class RoomCreationHandler:
         )
 
         if preset_config["encrypted"] or room_encryption_event:
+            raise SynapseError(400, "You cannot create an encrypted room.")
             if self._default_power_level_content_override:
                 override = self._default_power_level_content_override.get(preset_name)
                 if override is not None:
