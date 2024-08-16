@@ -150,7 +150,8 @@ class SynapseRequest(Request):
                 self.get_method(),
                 self.get_redacted_uri(),
             )
-            self.transport.abortConnection()
+            if self.channel:
+                self.channel.forceAbortClient()
             return
         super().handleContentChunk(data)
 
@@ -657,7 +658,7 @@ class SynapseSite(ProxySite):
         )
 
         self.site_tag = site_tag
-        self.reactor = reactor
+        self.reactor: ISynapseReactor = reactor
 
         assert config.http_options is not None
         proxied = config.http_options.x_forwarded
@@ -682,7 +683,7 @@ class SynapseSite(ProxySite):
         self.access_logger = logging.getLogger(logger_name)
         self.server_version_string = server_version_string.encode("ascii")
 
-    def log(self, request: SynapseRequest) -> None:
+    def log(self, request: SynapseRequest) -> None:  # type: ignore[override]
         pass
 
 

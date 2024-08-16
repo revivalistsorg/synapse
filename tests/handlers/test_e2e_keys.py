@@ -43,9 +43,7 @@ from tests.unittest import override_config
 class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
     def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
         self.appservice_api = mock.AsyncMock()
-        return self.setup_test_homeserver(
-            federation_client=mock.Mock(), application_service_api=self.appservice_api
-        )
+        return self.setup_test_homeserver(application_service_api=self.appservice_api)
 
     def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.handler = hs.get_e2e_keys_handler()
@@ -1101,6 +1099,56 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
             },
         )
 
+    def test_has_different_keys(self) -> None:
+        """check that has_different_keys returns True when the keys provided are different to what
+        is in the database."""
+        local_user = "@boris:" + self.hs.hostname
+        keys1 = {
+            "master_key": {
+                # private key: 2lonYOM6xYKdEsO+6KrC766xBcHnYnim1x/4LFGF8B0
+                "user_id": local_user,
+                "usage": ["master"],
+                "keys": {
+                    "ed25519:nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk": "nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk"
+                },
+            }
+        }
+        self.get_success(self.handler.upload_signing_keys_for_user(local_user, keys1))
+        is_different = self.get_success(
+            self.handler.has_different_keys(
+                local_user,
+                {
+                    "master_key": keys1["master_key"],
+                },
+            )
+        )
+        self.assertEqual(is_different, False)
+        # change the usage => different keys
+        keys1["master_key"]["usage"] = ["develop"]
+        is_different = self.get_success(
+            self.handler.has_different_keys(
+                local_user,
+                {
+                    "master_key": keys1["master_key"],
+                },
+            )
+        )
+        self.assertEqual(is_different, True)
+        keys1["master_key"]["usage"] = ["master"]  # reset
+        # change the key => different keys
+        keys1["master_key"]["keys"] = {
+            "ed25519:nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unIc0rncs": "nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unIc0rncs"
+        }
+        is_different = self.get_success(
+            self.handler.has_different_keys(
+                local_user,
+                {
+                    "master_key": keys1["master_key"],
+                },
+            )
+        )
+        self.assertEqual(is_different, True)
+
     def test_query_devices_remote_sync(self) -> None:
         """Tests that querying keys for a remote user that we share a room with,
         but haven't yet fetched the keys for, returns the cross signing keys
@@ -1172,6 +1220,61 @@ class E2eKeysHandlerTestCase(unittest.HomeserverTestCase):
                     },
                 }
             },
+        )
+
+    def test_query_devices_remote_down(self) -> None:
+        """Tests that querying keys for a remote user on an unreachable server returns
+        results in the "failures" property
+        """
+
+        remote_user_id = "@test:other"
+        local_user_id = "@test:test"
+
+        # The backoff code treats time zero as special
+        self.reactor.advance(5)
+
+        self.hs.get_federation_http_client().agent.request = mock.AsyncMock(  # type: ignore[method-assign]
+            side_effect=Exception("boop")
+        )
+
+        e2e_handler = self.hs.get_e2e_keys_handler()
+
+        query_result = self.get_success(
+            e2e_handler.query_devices(
+                {
+                    "device_keys": {remote_user_id: []},
+                },
+                timeout=10,
+                from_user_id=local_user_id,
+                from_device_id="some_device_id",
+            )
+        )
+
+        self.assertEqual(
+            query_result["failures"],
+            {
+                "other": {
+                    "message": "Failed to send request: Exception: boop",
+                    "status": 503,
+                }
+            },
+        )
+
+        # Do it again: we should hit the backoff
+        query_result = self.get_success(
+            e2e_handler.query_devices(
+                {
+                    "device_keys": {remote_user_id: []},
+                },
+                timeout=10,
+                from_user_id=local_user_id,
+                from_device_id="some_device_id",
+            )
+        )
+
+        self.assertEqual(
+            query_result["failures"],
+            {"other": {"message": "Not ready for retry", "status": 503}},
         )
 
     @parameterized.expand(

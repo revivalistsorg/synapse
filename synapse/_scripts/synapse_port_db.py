@@ -60,7 +60,7 @@ from synapse.logging.context import (
 )
 from synapse.notifier import ReplicationNotifier
 from synapse.storage.database import DatabasePool, LoggingTransaction, make_conn
-from synapse.storage.databases.main import FilteringWorkerStore, PushRuleStore
+from synapse.storage.databases.main import FilteringWorkerStore
 from synapse.storage.databases.main.account_data import AccountDataWorkerStore
 from synapse.storage.databases.main.client_ips import ClientIpBackgroundUpdateStore
 from synapse.storage.databases.main.deviceinbox import DeviceInboxBackgroundUpdateStore
@@ -77,10 +77,8 @@ from synapse.storage.databases.main.media_repository import (
 )
 from synapse.storage.databases.main.presence import PresenceBackgroundUpdateStore
 from synapse.storage.databases.main.profile import ProfileWorkerStore
-from synapse.storage.databases.main.pusher import (
-    PusherBackgroundUpdatesStore,
-    PusherWorkerStore,
-)
+from synapse.storage.databases.main.push_rule import PusherWorkerStore
+from synapse.storage.databases.main.pusher import PusherBackgroundUpdatesStore
 from synapse.storage.databases.main.receipts import ReceiptsBackgroundUpdateStore
 from synapse.storage.databases.main.registration import (
     RegistrationBackgroundUpdateStore,
@@ -121,18 +119,19 @@ BOOLEAN_COLUMNS = {
     "e2e_room_keys": ["is_verified"],
     "event_edges": ["is_state"],
     "events": ["processed", "outlier", "contains_url"],
-    "local_media_repository": ["safe_from_quarantine"],
+    "local_media_repository": ["safe_from_quarantine", "authenticated"],
+    "per_user_experimental_features": ["enabled"],
     "presence_list": ["accepted"],
     "presence_stream": ["currently_active"],
     "public_room_list_stream": ["visibility"],
     "pushers": ["enabled"],
     "redactions": ["have_censored"],
+    "remote_media_cache": ["authenticated"],
     "room_stats_state": ["is_federatable"],
     "rooms": ["is_public", "has_auth_chain_index"],
-    "users": ["shadow_banned", "approved", "locked"],
+    "users": ["shadow_banned", "approved", "locked", "suspended"],
     "un_partial_stated_event_stream": ["rejection_status_changed"],
     "users_who_share_rooms": ["share_private"],
-    "per_user_experimental_features": ["enabled"],
 }
 
 
@@ -245,7 +244,6 @@ class Store(
     AccountDataWorkerStore,
     FilteringWorkerStore,
     ProfileWorkerStore,
-    PushRuleStore,
     PusherWorkerStore,
     PusherBackgroundUpdatesStore,
     PresenceBackgroundUpdateStore,
@@ -780,22 +778,74 @@ class Porter:
             await self._setup_events_stream_seqs()
             await self._setup_sequence(
                 "un_partial_stated_event_stream_sequence",
-                ("un_partial_stated_event_stream",),
+                [("un_partial_stated_event_stream", "stream_id")],
             )
             await self._setup_sequence(
-                "device_inbox_sequence", ("device_inbox", "device_federation_outbox")
+                "device_inbox_sequence",
+                [
+                    ("device_inbox", "stream_id"),
+                    ("device_federation_outbox", "stream_id"),
+                ],
             )
             await self._setup_sequence(
                 "account_data_sequence",
-                ("room_account_data", "room_tags_revisions", "account_data"),
+                [
+                    ("room_account_data", "stream_id"),
+                    ("room_tags_revisions", "stream_id"),
+                    ("account_data", "stream_id"),
+                ],
             )
-            await self._setup_sequence("receipts_sequence", ("receipts_linearized",))
-            await self._setup_sequence("presence_stream_sequence", ("presence_stream",))
+            await self._setup_sequence(
+                "receipts_sequence",
+                [
+                    ("receipts_linearized", "stream_id"),
+                ],
+            )
+            await self._setup_sequence(
+                "presence_stream_sequence",
+                [
+                    ("presence_stream", "stream_id"),
+                ],
+            )
             await self._setup_auth_chain_sequence()
             await self._setup_sequence(
                 "application_services_txn_id_seq",
-                ("application_services_txns",),
-                "txn_id",
+                [
+                    (
+                        "application_services_txns",
+                        "txn_id",
+                    )
+                ],
+            )
+            await self._setup_sequence(
+                "device_lists_sequence",
+                [
+                    ("device_lists_stream", "stream_id"),
+                    ("user_signature_stream", "stream_id"),
+                    ("device_lists_outbound_pokes", "stream_id"),
+                    ("device_lists_changes_in_room", "stream_id"),
+                    ("device_lists_remote_pending", "stream_id"),
+                    ("device_lists_changes_converted_stream_position", "stream_id"),
+                ],
+            )
+            await self._setup_sequence(
+                "e2e_cross_signing_keys_sequence",
+                [
+                    ("e2e_cross_signing_keys", "stream_id"),
+                ],
+            )
+            await self._setup_sequence(
+                "push_rules_stream_sequence",
+                [
+                    ("push_rules_stream", "stream_id"),
+                ],
+            )
+            await self._setup_sequence(
+                "pushers_sequence",
+                [
+                    ("pushers", "id"),
+                    ("deleted_pushers", "stream_id"),
+                ],
             )
 
             # Step 3. Get tables.
@@ -1104,12 +1154,11 @@ class Porter:
     async def _setup_sequence(
         self,
         sequence_name: str,
-        stream_id_tables: Iterable[str],
-        column_name: str = "stream_id",
+        stream_id_tables: Iterable[Tuple[str, str]],
     ) -> None:
         """Set a sequence to the correct value."""
         current_stream_ids = []
-        for stream_id_table in stream_id_tables:
+        for stream_id_table, column_name in stream_id_tables:
             max_stream_id = cast(
                 int,
                 await self.sqlite_store.db_pool.simple_select_one_onecol(

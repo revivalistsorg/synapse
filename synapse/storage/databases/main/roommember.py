@@ -39,6 +39,7 @@ from typing import (
 import attr
 
 from synapse.api.constants import EventTypes, Membership
+from synapse.logging.opentracing import trace
 from synapse.metrics import LaterGauge
 from synapse.metrics.background_process_metrics import wrap_as_background_process
 from synapse.storage._base import SQLBaseStore, db_to_json, make_in_list_sql_clause
@@ -50,12 +51,7 @@ from synapse.storage.database import (
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.engines import Sqlite3Engine
-from synapse.storage.roommember import (
-    GetRoomsForUserWithStreamOrdering,
-    MemberSummary,
-    ProfileInfo,
-    RoomsForUser,
-)
+from synapse.storage.roommember import MemberSummary, ProfileInfo, RoomsForUser
 from synapse.types import (
     JsonDict,
     PersistedEventPosition,
@@ -284,8 +280,19 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
 
     @cached(max_entries=100000)  # type: ignore[synapse-@cached-mutable]
     async def get_room_summary(self, room_id: str) -> Mapping[str, MemberSummary]:
-        """Get the details of a room roughly suitable for use by the room
+        """
+        Get the details of a room roughly suitable for use by the room
         summary extension to /sync. Useful when lazy loading room members.
+
+        Returns the total count of members in the room by membership type, and a
+        truncated list of members (the heroes). This will be the first 6 members of the
+        room:
+        - We want 5 heroes plus 1, in case one of them is the
+        calling user.
+        - They are ordered by `stream_ordering`, which are joined or
+        invited. When no joined or invited members are available, this also includes
+        banned and left users.
+
         Args:
             room_id: The room ID to query
         Returns:
@@ -313,23 +320,36 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
             for count, membership in txn:
                 res.setdefault(membership, MemberSummary([], count))
 
-            # we order by membership and then fairly arbitrarily by event_id so
-            # heroes are consistent
-            # Note, rejected events will have a null membership field, so
-            # we we manually filter them out.
+            # Order by membership (joins -> invites -> leave (former insiders) ->
+            # everything else (outsiders like bans/knocks), then by `stream_ordering` so
+            # the first members in the room show up first and to make the sort stable
+            # (consistent heroes).
+            #
+            # Note: rejected events will have a null membership field, so we we manually
+            # filter them out.
             sql = """
                 SELECT state_key, membership, event_id
                 FROM current_state_events
                 WHERE type = 'm.room.member' AND room_id = ?
                     AND membership IS NOT NULL
                 ORDER BY
-                    CASE membership WHEN ? THEN 1 WHEN ? THEN 2 ELSE 3 END ASC,
-                    event_id ASC
+                    CASE membership WHEN ? THEN 1 WHEN ? THEN 2 WHEN ? THEN 3 ELSE 4 END ASC,
+                    event_stream_ordering ASC
                 LIMIT ?
             """
 
-            # 6 is 5 (number of heroes) plus 1, in case one of them is the calling user.
-            txn.execute(sql, (room_id, Membership.JOIN, Membership.INVITE, 6))
+            txn.execute(
+                sql,
+                (
+                    room_id,
+                    # Sort order
+                    Membership.JOIN,
+                    Membership.INVITE,
+                    Membership.LEAVE,
+                    # 6 is 5 (number of heroes) plus 1, in case one of them is the calling user.
+                    6,
+                ),
+            )
             for user_id, membership, event_id in txn:
                 summary = res[membership]
                 # we will always have a summary for this membership type at this
@@ -369,6 +389,22 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
             user_id, [Membership.INVITE]
         )
 
+    async def get_knocked_at_rooms_for_local_user(
+        self, user_id: str
+    ) -> Sequence[RoomsForUser]:
+        """Get all the rooms the *local* user has knocked at.
+
+        Args:
+            user_id: The user ID.
+
+        Returns:
+            A list of RoomsForUser.
+        """
+
+        return await self.get_rooms_for_local_user_where_membership_is(
+            user_id, [Membership.KNOCK]
+        )
+
     async def get_invite_for_local_user_in_room(
         self, user_id: str, room_id: str
     ) -> Optional[RoomsForUser]:
@@ -387,6 +423,7 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
                 return invite
         return None
 
+    @trace
     async def get_rooms_for_local_user_where_membership_is(
         self,
         user_id: str,
@@ -410,9 +447,11 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         if not membership_list:
             return []
 
-        rooms = await self.db_pool.runInteraction(
-            "get_rooms_for_local_user_where_membership_is",
-            self._get_rooms_for_local_user_where_membership_is_txn,
+        # Convert membership list to frozen set as a) it needs to be hashable,
+        # and b) we don't care about the order.
+        membership_list = frozenset(membership_list)
+
+        rooms = await self._get_rooms_for_local_user_where_membership_is_inner(
             user_id,
             membership_list,
         )
@@ -430,6 +469,24 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
             rooms_to_exclude.update(excluded_rooms)
 
         return [room for room in rooms if room.room_id not in rooms_to_exclude]
+
+    @cached(max_entries=1000, tree=True)
+    async def _get_rooms_for_local_user_where_membership_is_inner(
+        self,
+        user_id: str,
+        membership_list: Collection[str],
+    ) -> Sequence[RoomsForUser]:
+        if not membership_list:
+            return []
+
+        rooms = await self.db_pool.runInteraction(
+            "get_rooms_for_local_user_where_membership_is",
+            self._get_rooms_for_local_user_where_membership_is_txn,
+            user_id,
+            membership_list,
+        )
+
+        return rooms
 
     def _get_rooms_for_local_user_where_membership_is_txn(
         self,
@@ -460,7 +517,7 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         )
 
         sql = """
-            SELECT room_id, e.sender, c.membership, event_id, e.stream_ordering, r.room_version
+            SELECT room_id, e.sender, c.membership, event_id, e.instance_name, e.stream_ordering, r.room_version
             FROM local_current_membership AS c
             INNER JOIN events AS e USING (room_id, event_id)
             INNER JOIN rooms AS r USING (room_id)
@@ -472,7 +529,21 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         )
 
         txn.execute(sql, (user_id, *args))
-        results = [RoomsForUser(*r) for r in txn]
+        results = [
+            RoomsForUser(
+                room_id=room_id,
+                sender=sender,
+                membership=membership,
+                event_id=event_id,
+                event_pos=PersistedEventPosition(
+                    # If instance_name is null we default to "master"
+                    instance_name or "master",
+                    stream_ordering,
+                ),
+                room_version_id=room_version,
+            )
+            for room_id, sender, membership, event_id, instance_name, stream_ordering, room_version in txn
+        ]
 
         return results
 
@@ -580,53 +651,6 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
 
         return results
 
-    @cached(max_entries=500000, iterable=True)
-    async def get_rooms_for_user_with_stream_ordering(
-        self, user_id: str
-    ) -> FrozenSet[GetRoomsForUserWithStreamOrdering]:
-        """Returns a set of room_ids the user is currently joined to.
-
-        If a remote user only returns rooms this server is currently
-        participating in.
-
-        Args:
-            user_id
-
-        Returns:
-            Returns the rooms the user is in currently, along with the stream
-            ordering of the most recent join for that user and room, along with
-            the room version of the room.
-        """
-        return await self.db_pool.runInteraction(
-            "get_rooms_for_user_with_stream_ordering",
-            self._get_rooms_for_user_with_stream_ordering_txn,
-            user_id,
-        )
-
-    def _get_rooms_for_user_with_stream_ordering_txn(
-        self, txn: LoggingTransaction, user_id: str
-    ) -> FrozenSet[GetRoomsForUserWithStreamOrdering]:
-        # We use `current_state_events` here and not `local_current_membership`
-        # as a) this gets called with remote users and b) this only gets called
-        # for rooms the server is participating in.
-        sql = """
-            SELECT room_id, e.instance_name, e.stream_ordering
-            FROM current_state_events AS c
-            INNER JOIN events AS e USING (room_id, event_id)
-            WHERE
-                c.type = 'm.room.member'
-                AND c.state_key = ?
-                AND c.membership = ?
-        """
-
-        txn.execute(sql, (user_id, Membership.JOIN))
-        return frozenset(
-            GetRoomsForUserWithStreamOrdering(
-                room_id, PersistedEventPosition(instance, stream_id)
-            )
-            for room_id, instance, stream_id in txn
-        )
-
     async def get_users_server_still_shares_room_with(
         self, user_ids: Collection[str]
     ) -> Set[str]:
@@ -675,13 +699,6 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
         If a remote user only returns rooms this server is currently
         participating in.
         """
-        rooms = self.get_rooms_for_user_with_stream_ordering.cache.get_immediate(
-            (user_id,),
-            None,
-            update_metrics=False,
-        )
-        if rooms:
-            return frozenset(r.room_id for r in rooms)
 
         room_ids = await self.db_pool.simple_select_onecol(
             table="current_state_events",
@@ -1218,6 +1235,28 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
 
         return set(room_ids)
 
+    async def get_membership_event_ids_for_user(
+        self, user_id: str, room_id: str
+    ) -> Set[str]:
+        """Get all event_ids for the given user and room.
+
+        Args:
+            user_id: The user ID to get the event IDs for.
+            room_id: The room ID to look up events for.
+
+        Returns:
+            Set of event IDs
+        """
+
+        event_ids = await self.db_pool.simple_select_onecol(
+            table="room_memberships",
+            keyvalues={"user_id": user_id, "room_id": room_id},
+            retcol="event_id",
+            desc="get_membership_event_ids_for_user",
+        )
+
+        return set(event_ids)
+
     @cached(max_entries=5000)
     async def _get_membership_from_event_id(
         self, member_event_id: str
@@ -1516,9 +1555,18 @@ def extract_heroes_from_room_summary(
 ) -> List[str]:
     """Determine the users that represent a room, from the perspective of the `me` user.
 
+    This function expects `MemberSummary.members` to already be sorted by
+    `stream_ordering` like the results from `get_room_summary(...)`.
+
     The rules which say which users we select are specified in the "Room Summary"
     section of
     https://spec.matrix.org/v1.4/client-server-api/#get_matrixclientv3sync
+
+
+    Args:
+        details: Mapping from membership type to member summary. We expect
+            `MemberSummary.members` to already be sorted by `stream_ordering`.
+        me: The user for whom we are determining the heroes for.
 
     Returns a list (possibly empty) of heroes' mxids.
     """
@@ -1534,11 +1582,11 @@ def extract_heroes_from_room_summary(
         r[0] for r in details.get(Membership.LEAVE, empty_ms).members if r[0] != me
     ] + [r[0] for r in details.get(Membership.BAN, empty_ms).members if r[0] != me]
 
-    # FIXME: order by stream ordering rather than as returned by SQL
+    # We expect `MemberSummary.members` to already be sorted by `stream_ordering`
     if joined_user_ids or invited_user_ids:
-        return sorted(joined_user_ids + invited_user_ids)[0:5]
+        return (joined_user_ids + invited_user_ids)[0:5]
     else:
-        return sorted(gone_user_ids)[0:5]
+        return gone_user_ids[0:5]
 
 
 @attr.s(slots=True, auto_attribs=True)

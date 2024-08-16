@@ -47,7 +47,7 @@ from typing import (
     Union,
     cast,
 )
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import attr
 from incremental import Version
@@ -55,6 +55,7 @@ from typing_extensions import ParamSpec
 from zope.interface import implementer
 
 import twisted
+from twisted.enterprise import adbapi
 from twisted.internet import address, tcp, threads, udp
 from twisted.internet._resolver import SimpleResolverComplexifier
 from twisted.internet.defer import Deferred, fail, maybeDeferred, succeed
@@ -84,6 +85,7 @@ from twisted.web.server import Request, Site
 
 from synapse.config.database import DatabaseConnectionConfig
 from synapse.config.homeserver import HomeServerConfig
+from synapse.events.auto_accept_invites import InviteAutoAccepter
 from synapse.events.presence_router import load_legacy_presence_router
 from synapse.handlers.auth import load_legacy_password_auth_providers
 from synapse.http.site import SynapseRequest
@@ -94,8 +96,8 @@ from synapse.module_api.callbacks.third_party_event_rules_callbacks import (
 )
 from synapse.server import HomeServer
 from synapse.storage import DataStore
-from synapse.storage.database import LoggingDatabaseConnection
-from synapse.storage.engines import create_engine
+from synapse.storage.database import LoggingDatabaseConnection, make_pool
+from synapse.storage.engines import BaseDatabaseEngine, create_engine
 from synapse.storage.prepare_database import prepare_database
 from synapse.types import ISynapseReactor, JsonDict
 from synapse.util import Clock
@@ -196,17 +198,35 @@ class FakeChannel:
     def headers(self) -> Headers:
         if not self.result:
             raise Exception("No result yet.")
-        h = Headers()
-        for i in self.result["headers"]:
-            h.addRawHeader(*i)
+
+        h = self.result["headers"]
+        assert isinstance(h, Headers)
         return h
 
     def writeHeaders(
-        self, version: bytes, code: bytes, reason: bytes, headers: Headers
+        self,
+        version: bytes,
+        code: bytes,
+        reason: bytes,
+        headers: Union[Headers, List[Tuple[bytes, bytes]]],
     ) -> None:
         self.result["version"] = version
         self.result["code"] = code
         self.result["reason"] = reason
+
+        if isinstance(headers, list):
+            # Support prior to Twisted 24.7.0rc1
+            new_headers = Headers()
+            for k, v in headers:
+                assert isinstance(k, bytes), f"key is not of type bytes: {k!r}"
+                assert isinstance(v, bytes), f"value is not of type bytes: {v!r}"
+                new_headers.addRawHeader(k, v)
+            headers = new_headers
+
+        assert isinstance(
+            headers, Headers
+        ), f"headers are of the wrong type: {headers!r}"
+
         self.result["headers"] = headers
 
     def write(self, data: bytes) -> None:
@@ -287,10 +307,6 @@ class FakeChannel:
         self._reactor.run()
 
         while not self.is_finished():
-            # If there's a producer, tell it to resume producing so we get content
-            if self._producer:
-                self._producer.resumeProducing()
-
             if self._reactor.seconds() > end_time:
                 raise TimedOutException("Timed out waiting for request to finish.")
 
@@ -350,6 +366,7 @@ def make_request(
     request: Type[Request] = SynapseRequest,
     shorthand: bool = True,
     federation_auth_origin: Optional[bytes] = None,
+    content_type: Optional[bytes] = None,
     content_is_form: bool = False,
     await_result: bool = True,
     custom_headers: Optional[Iterable[CustomHeaderType]] = None,
@@ -372,6 +389,8 @@ def make_request(
             with the usual REST API path, if it doesn't contain it.
         federation_auth_origin: if set to not-None, we will add a fake
             Authorization header pretenting to be the given server name.
+        content_type: The content-type to use for the request. If not set then will default to
+            application/json unless content_is_form is true.
         content_is_form: Whether the content is URL encoded form data. Adds the
             'Content-Type': 'application/x-www-form-urlencoded' header.
         await_result: whether to wait for the request to complete rendering. If true,
@@ -435,7 +454,9 @@ def make_request(
         )
 
     if content:
-        if content_is_form:
+        if content_type is not None:
+            req.requestHeaders.addRawHeader(b"Content-Type", content_type)
+        elif content_is_form:
             req.requestHeaders.addRawHeader(
                 b"Content-Type", b"application/x-www-form-urlencoded"
             )
@@ -670,6 +691,53 @@ def validate_connector(connector: tcp.Connector, expected_ip: str) -> None:
         )
 
 
+def make_fake_db_pool(
+    reactor: ISynapseReactor,
+    db_config: DatabaseConnectionConfig,
+    engine: BaseDatabaseEngine,
+) -> adbapi.ConnectionPool:
+    """Wrapper for `make_pool` which builds a pool which runs db queries synchronously.
+
+    For more deterministic testing, we don't use a regular db connection pool: instead
+    we run all db queries synchronously on the test reactor's main thread. This function
+    is a drop-in replacement for the normal `make_pool` which builds such a connection
+    pool.
+    """
+    pool = make_pool(reactor, db_config, engine)
+
+    def runWithConnection(
+        func: Callable[..., R], *args: Any, **kwargs: Any
+    ) -> Awaitable[R]:
+        return threads.deferToThreadPool(
+            pool._reactor,
+            pool.threadpool,
+            pool._runWithConnection,
+            func,
+            *args,
+            **kwargs,
+        )
+
+    def runInteraction(
+        desc: str, func: Callable[..., R], *args: Any, **kwargs: Any
+    ) -> Awaitable[R]:
+        return threads.deferToThreadPool(
+            pool._reactor,
+            pool.threadpool,
+            pool._runInteraction,
+            desc,
+            func,
+            *args,
+            **kwargs,
+        )
+
+    pool.runWithConnection = runWithConnection  # type: ignore[method-assign]
+    pool.runInteraction = runInteraction  # type: ignore[assignment]
+    # Replace the thread pool with a threadless 'thread' pool
+    pool.threadpool = ThreadPool(reactor)
+    pool.running = True
+    return pool
+
+
 class ThreadPool:
     """
     Threadless thread pool.
@@ -704,52 +772,6 @@ class ThreadPool:
         d.addBoth(_)
         self._reactor.callLater(0, d.callback, True)
         return d
-
-
-def _make_test_homeserver_synchronous(server: HomeServer) -> None:
-    """
-    Make the given test homeserver's database interactions synchronous.
-    """
-
-    clock = server.get_clock()
-
-    for database in server.get_datastores().databases:
-        pool = database._db_pool
-
-        def runWithConnection(
-            func: Callable[..., R], *args: Any, **kwargs: Any
-        ) -> Awaitable[R]:
-            return threads.deferToThreadPool(
-                pool._reactor,
-                pool.threadpool,
-                pool._runWithConnection,
-                func,
-                *args,
-                **kwargs,
-            )
-
-        def runInteraction(
-            desc: str, func: Callable[..., R], *args: Any, **kwargs: Any
-        ) -> Awaitable[R]:
-            return threads.deferToThreadPool(
-                pool._reactor,
-                pool.threadpool,
-                pool._runInteraction,
-                desc,
-                func,
-                *args,
-                **kwargs,
-            )
-
-        pool.runWithConnection = runWithConnection  # type: ignore[method-assign]
-        pool.runInteraction = runInteraction  # type: ignore[assignment]
-        # Replace the thread pool with a threadless 'thread' pool
-        pool.threadpool = ThreadPool(clock._reactor)
-        pool.running = True
-
-    # We've just changed the Databases to run DB transactions on the same
-    # thread, so we need to disable the dedicated thread behaviour.
-    server.get_datastores().main.USE_DEDICATED_DB_THREADS_FOR_EVENT_FETCHING = False
 
 
 def get_clock() -> Tuple[ThreadedMemoryReactorClock, Clock]:
@@ -938,7 +960,7 @@ def connect_client(
 
 
 class TestHomeServer(HomeServer):
-    DATASTORE_CLASS = DataStore  # type: ignore[assignment]
+    DATASTORE_CLASS = DataStore
 
 
 def setup_test_homeserver(
@@ -1067,7 +1089,14 @@ def setup_test_homeserver(
     # Mock TLS
     hs.tls_server_context_factory = Mock()
 
-    hs.setup()
+    # Patch `make_pool` before initialising the database, to make database transactions
+    # synchronous for testing.
+    with patch("synapse.storage.database.make_pool", side_effect=make_fake_db_pool):
+        hs.setup()
+
+    # Since we've changed the databases to run DB transactions on the same
+    # thread, we need to stop the event fetcher hogging that one thread.
+    hs.get_datastores().main.USE_DEDICATED_DB_THREADS_FOR_EVENT_FETCHING = False
 
     if USE_POSTGRES_FOR_TESTS:
         database_pool = hs.get_datastores().databases[0]
@@ -1137,13 +1166,21 @@ def setup_test_homeserver(
 
     hs.get_auth_handler().validate_hash = validate_hash  # type: ignore[assignment]
 
-    # Make the threadpool and database transactions synchronous for testing.
-    _make_test_homeserver_synchronous(hs)
+    # We need to replace the media threadpool with the fake test threadpool.
+    def thread_pool() -> threadpool.ThreadPool:
+        return reactor.getThreadPool()
+
+    hs.get_media_sender_thread_pool = thread_pool  # type: ignore[method-assign]
 
     # Load any configured modules into the homeserver
     module_api = hs.get_module_api()
     for module, module_config in hs.config.modules.loaded_modules:
         module(config=module_config, api=module_api)
+
+    if hs.config.auto_accept_invites.enabled:
+        # Start the local auto_accept_invites module.
+        m = InviteAutoAccepter(hs.config.auto_accept_invites, module_api)
+        logger.info("Loaded local module %s", m)
 
     load_legacy_spam_checkers(hs)
     load_legacy_third_party_event_rules(hs)
